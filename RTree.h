@@ -114,6 +114,13 @@ public:
   /// \return Returns the number of entries found
   size_t NNSearch(const ELEMTYPE a_min[NUMDIMS], const ELEMTYPE a_max[NUMDIMS], std::function<bool(const DATATYPE&, ELEMTYPE)> callback) const;
 
+  /// Find the nearest neighbors with spherical distance metric
+  /// \param a_min Min of search bounding rect
+  /// \param a_max Max of search bounding rect
+  /// \param a_resultCallback Callback function to return result.  The Callback takes both the resulting data point and the calculated square distance. Callback should return 'true' to continue searching
+  /// \return Returns the number of entries found
+  size_t NNSearchSphere(const ELEMTYPE a_min[NUMDIMS], const ELEMTYPE a_max[NUMDIMS], std::function<bool(const DATATYPE&, ELEMTYPE)> callback) const;
+
 
   /// Remove all entries from tree
   void RemoveAll();
@@ -374,7 +381,10 @@ protected:
   ListNode* AllocListNode();
   void FreeListNode(ListNode* a_listNode);
   bool Overlap(Rect* a_rectA, Rect* a_rectB) const;
+  ELEMTYPE SphericalDistancePoints(ELEMTYPE left_x, ELEMTYPE left_y,
+                                   ELEMTYPE right_x, ELEMTYPE right_y) const;
   ELEMTYPE SquareDistance(Rect const& a_rectA, Rect const& a_rectB) const;
+  ELEMTYPE SphericalDistance(Rect const& a_rectA, Rect const& a_rectB) const;
   void ReInsert(Node* a_node, ListNode** a_listNode);
   bool Search(Node* a_node, Rect* a_rect, int& a_foundCount, std::function<bool (const DATATYPE&)> callback) const;
   void RemoveAllRec(Node* a_node);
@@ -646,6 +656,86 @@ size_t RTREE_QUAL::NNSearch(
             for (auto i = 0; i < node->m_count; ++i)
             {
                 auto d = this->SquareDistance(rect, node->m_branch[i].m_rect);
+                search_queue.emplace(node->m_branch + i, d);
+            }
+        }
+        else
+        {
+            // If this is a leaf, then we have found a minimum distance
+            // Call the callback
+            ++foundCount;
+            if (!callback(process.branch->m_data, process.distance))
+            {
+                // If the user has flaged to stopped, then return
+                // the number found.
+                return foundCount;
+            }
+        }
+
+    }
+
+    // No more items to search
+    return foundCount;
+}
+
+RTREE_TEMPLATE
+size_t RTREE_QUAL::NNSearchSphere(
+    const ELEMTYPE a_min[NUMDIMS], const ELEMTYPE a_max[NUMDIMS],
+    std::function<bool(const DATATYPE&, ELEMTYPE)> callback
+) const
+{
+    // Create a search rectangle
+    Rect rect;
+    for (int axis = 0; axis < NUMDIMS; ++axis)
+    {
+        rect.m_min[axis] = a_min[axis];
+        rect.m_max[axis] = a_max[axis];
+    }
+
+    // class to store branches in the priority queue
+    struct QueueItem
+    {
+        QueueItem(Branch* branch, ELEMTYPE distance) :
+            branch(branch),
+            distance(distance)
+        {}
+
+        // Sort in the queue with the minimum distance
+        // taking priority
+        bool operator<(QueueItem const& a) const
+        {
+            return this->distance > a.distance;
+        }
+
+        Branch* branch;
+        ELEMTYPE distance;
+    };
+
+    std::priority_queue<QueueItem> search_queue;
+
+    // All branches in the root node are inserted into the priority queue. 
+    for (auto i = 0; i < m_root->m_count; ++i)
+    {
+        auto d = this->SphericalDistance(rect, m_root->m_branch[i].m_rect);
+        search_queue.emplace(m_root->m_branch + i, d);
+    }
+
+    size_t foundCount = 0;
+
+    // Until the queue is empty
+    while (!search_queue.empty())
+    {
+        // Process the top item in the queue
+        auto process = std::move(search_queue.top());
+        search_queue.pop();
+
+        if (process.branch->m_child)
+        {
+            // If the branch has children, add them all into the queue
+            Node* node = process.branch->m_child;
+            for (auto i = 0; i < node->m_count; ++i)
+            {
+                auto d = this->SphericalDistance(rect, node->m_branch[i].m_rect);
                 search_queue.emplace(node->m_branch + i, d);
             }
         }
@@ -1717,6 +1807,100 @@ ELEMTYPE RTREE_QUAL::SquareDistance(Rect const& a_rectA, Rect const& a_rectB) co
         dist += diff1 * diff2 < 0 ? 0 : std::min(diff1 * diff1, diff2 * diff2);
 
     }
+    return dist;
+}
+
+RTREE_TEMPLATE
+ELEMTYPE RTREE_QUAL::SphericalDistancePoints(ELEMTYPE left_x, ELEMTYPE left_y,
+                                             ELEMTYPE right_x,
+                                             ELEMTYPE right_y) const {
+  return 2 * 6371 *
+         std::asin(std::sqrt(
+             0.5 - (std::cos((left_y - right_y) * (M_PI / 180)) / 2) +
+             (std::cos(right_y * (M_PI / 180)) *
+              std::cos(left_y * (M_PI / 180)) *
+              ((1 - std::cos((left_x - right_x) * (M_PI / 180))) / 2))));
+}
+
+RTREE_TEMPLATE
+ELEMTYPE RTREE_QUAL::SphericalDistance(Rect const& a_rectA, Rect const& a_rectB) const
+{
+    ELEMTYPE dist = INFINITY;
+    // assume that NUMDIMS is 2
+
+    // check it is in the box first
+    bool is_in_box = false;
+    for (int index = 0; index < NUMDIMS; ++index)
+    {
+        auto diff1 = a_rectA.m_min[index] - a_rectB.m_max[index];
+        auto diff2 = a_rectA.m_max[index] - a_rectB.m_min[index];
+
+        if (diff1 * diff2 < 0) {
+          is_in_box = true;
+          break;
+        }
+    }
+
+    if (is_in_box) {
+        return 0;
+    }
+
+    // jsut put unrolled loop here
+    // from a_rectA.m_min[0], a_rectA.m_min[1]
+    dist = std::min(
+        dist, SphericalDistancePoints(a_rectA.m_min[0], a_rectA.m_min[1],
+                                      a_rectB.m_min[0], a_rectB.m_min[1]));
+    dist = std::min(
+        dist, SphericalDistancePoints(a_rectA.m_min[0], a_rectA.m_min[1],
+                                      a_rectB.m_max[0], a_rectB.m_min[1]));
+    dist = std::min(
+        dist, SphericalDistancePoints(a_rectA.m_min[0], a_rectA.m_min[1],
+                                      a_rectB.m_min[0], a_rectB.m_max[1]));
+    dist = std::min(
+        dist, SphericalDistancePoints(a_rectA.m_min[0], a_rectA.m_min[1],
+                                      a_rectB.m_max[0], a_rectB.m_max[1]));
+
+    // from a_rectA.m_min[0], a_rectA.m_max[1]
+    dist = std::min(
+        dist, SphericalDistancePoints(a_rectA.m_min[0], a_rectA.m_max[1],
+                                      a_rectB.m_min[0], a_rectB.m_min[1]));
+    dist = std::min(
+        dist, SphericalDistancePoints(a_rectA.m_min[0], a_rectA.m_max[1],
+                                      a_rectB.m_max[0], a_rectB.m_min[1]));
+    dist = std::min(
+        dist, SphericalDistancePoints(a_rectA.m_min[0], a_rectA.m_max[1],
+                                      a_rectB.m_min[0], a_rectB.m_max[1]));
+    dist = std::min(
+        dist, SphericalDistancePoints(a_rectA.m_min[0], a_rectA.m_max[1],
+                                      a_rectB.m_max[0], a_rectB.m_max[1]));
+
+    // from a_rectA.m_max[0], a_rectA.m_min[1]
+    dist = std::min(
+        dist, SphericalDistancePoints(a_rectA.m_max[0], a_rectA.m_min[1],
+                                      a_rectB.m_min[0], a_rectB.m_min[1]));
+    dist = std::min(
+        dist, SphericalDistancePoints(a_rectA.m_max[0], a_rectA.m_min[1],
+                                      a_rectB.m_max[0], a_rectB.m_min[1]));
+    dist = std::min(
+        dist, SphericalDistancePoints(a_rectA.m_max[0], a_rectA.m_min[1],
+                                      a_rectB.m_min[0], a_rectB.m_max[1]));
+    dist = std::min(
+        dist, SphericalDistancePoints(a_rectA.m_max[0], a_rectA.m_min[1],
+                                      a_rectB.m_max[0], a_rectB.m_max[1]));
+
+    // from a_rectA.m_max[0], a_rectA.m_max[1]
+    dist = std::min(
+        dist, SphericalDistancePoints(a_rectA.m_max[0], a_rectA.m_max[1],
+                                      a_rectB.m_min[0], a_rectB.m_min[1]));
+    dist = std::min(
+        dist, SphericalDistancePoints(a_rectA.m_max[0], a_rectA.m_max[1],
+                                      a_rectB.m_max[0], a_rectB.m_min[1]));
+    dist = std::min(
+        dist, SphericalDistancePoints(a_rectA.m_max[0], a_rectA.m_max[1],
+                                      a_rectB.m_min[0], a_rectB.m_max[1]));
+    dist = std::min(
+        dist, SphericalDistancePoints(a_rectA.m_max[0], a_rectA.m_max[1],
+                                      a_rectB.m_max[0], a_rectB.m_max[1]));
     return dist;
 }
 
